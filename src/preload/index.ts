@@ -6,6 +6,7 @@ const api = {
   scanDevice: (args?: { driveHint?: string }) => ipcRenderer.invoke('scan-device', args),
   saveConfig: (args: { drive: string; config: Record<string, unknown>; initializePython?: boolean }) =>
     ipcRenderer.invoke('save-config', args),
+  activateProfile: (profile: number) => ipcRenderer.invoke('telemetry-set-active-profile', { profile }),
   startTelemetry: () => ipcRenderer.invoke('telemetry-start'),
   stopTelemetry: () => ipcRenderer.invoke('telemetry-stop'),
   onTelemetry: (callback: (payload: Record<string, unknown>) => void) => {

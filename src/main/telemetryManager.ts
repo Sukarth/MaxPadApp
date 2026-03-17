@@ -7,17 +7,35 @@ type TelemetryPayload = {
   screen?: string
   pressed?: boolean[]
   active_profile?: number
+  profile?: number
   ts?: number
 }
 
 let activePort: SerialPort | null = null
 let activePortPath: string | null = null
 let activeParser: ReadlineParser | null = null
+let hasSeenTelemetry = false
+let lastObservedActiveProfile: number | null = null
+
+let pendingProfileAck:
+  | {
+      profile: number
+      resolve: () => void
+      reject: (err: Error) => void
+      timer: NodeJS.Timeout
+    }
+  | null = null
 
 const senderDirtyState = new Map<number, boolean>()
 const closePending = new Set<number>()
 
 function cleanupActivePort() {
+  if (pendingProfileAck) {
+    clearTimeout(pendingProfileAck.timer)
+    pendingProfileAck.reject(new Error('Serial connection closed before profile switch ACK'))
+    pendingProfileAck = null
+  }
+
   try {
     if (activeParser) {
       activeParser.removeAllListeners('data')
@@ -31,15 +49,92 @@ function cleanupActivePort() {
       activePort = null
     }
     activePortPath = null
+    hasSeenTelemetry = false
   } catch {
     // ignore close errors
   }
 }
 
+function handleIncomingPayload(payload: TelemetryPayload) {
+  if (Number.isInteger(payload.active_profile)) {
+    lastObservedActiveProfile = payload.active_profile as number
+  }
+
+  if (
+    pendingProfileAck &&
+    ((payload.type === 'active_profile_set' &&
+      Number.isInteger(payload.profile) &&
+      payload.profile === pendingProfileAck.profile) ||
+      (Number.isInteger(payload.active_profile) && payload.active_profile === pendingProfileAck.profile))
+  ) {
+    clearTimeout(pendingProfileAck.timer)
+    pendingProfileAck.resolve()
+    pendingProfileAck = null
+  }
+
+  if (
+    payload &&
+    (payload.type === 'telemetry' ||
+      payload.type === 'pong' ||
+      payload.type === 'active_profile_set' ||
+      Array.isArray(payload.pressed) ||
+      typeof payload.screen === 'string')
+  ) {
+    hasSeenTelemetry = true
+    forwardTelemetry(payload)
+  }
+}
+
+function waitForProfileAck(profile: number, timeoutMs: number) {
+  if (lastObservedActiveProfile === profile) {
+    return Promise.resolve()
+  }
+
+  if (pendingProfileAck) {
+    clearTimeout(pendingProfileAck.timer)
+    pendingProfileAck.reject(new Error('Superseded by another profile switch request'))
+    pendingProfileAck = null
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (pendingProfileAck && pendingProfileAck.profile === profile) {
+        pendingProfileAck = null
+      }
+      reject(new Error('No ACK from MaxPad for profile switch'))
+    }, timeoutMs)
+
+    pendingProfileAck = { profile, resolve, reject, timer }
+  })
+}
+
+function sendSerialCommandAsync(payload: Record<string, unknown>) {
+  if (!activePort || !activePort.isOpen) {
+    return Promise.reject(new Error('Telemetry serial port is not connected'))
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    activePort!.write(`${JSON.stringify(payload)}\n`, (err) => {
+      if (err) {
+        reject(err)
+        return
+      }
+
+      activePort!.drain((drainErr) => {
+        if (drainErr) {
+          reject(drainErr)
+          return
+        }
+        resolve()
+      })
+    })
+  })
+}
+
 function isLikelyBoardPort(port: Awaited<ReturnType<typeof SerialPort.list>>[number]) {
   const vendorId = (port.vendorId || '').toLowerCase()
   const productId = (port.productId || '').toLowerCase()
-  const text = [port.path, port.manufacturer, port.friendlyName, port.pnpId]
+  const text = [port.path, port.manufacturer, (port as any).friendlyName, port.pnpId]
     .filter(Boolean)
     .join(' ')
     .toLowerCase()
@@ -69,6 +164,8 @@ function forwardTelemetry(payload: TelemetryPayload) {
   }
 }
 
+
+
 async function openCandidatePort(path: string) {
   return new Promise<boolean>((resolve) => {
     const port = new SerialPort({ path, baudRate: 115200, autoOpen: false })
@@ -93,14 +190,17 @@ async function openCandidatePort(path: string) {
       parser.on('data', (raw: string) => {
         try {
           const payload = JSON.parse(raw) as TelemetryPayload
+          if (!payload) return
+
           if (
-            payload &&
-            (payload.type === 'telemetry' ||
-              Array.isArray(payload.pressed) ||
-              typeof payload.screen === 'string')
+            payload.type === 'telemetry' ||
+            payload.type === 'pong' ||
+            payload.type === 'active_profile_set' ||
+            Array.isArray(payload.pressed) ||
+            typeof payload.screen === 'string'
           ) {
             acceptAndResolve()
-            forwardTelemetry(payload)
+            handleIncomingPayload(payload)
           }
         } catch {
           // ignore non-json lines
@@ -110,6 +210,13 @@ async function openCandidatePort(path: string) {
       port.on('error', () => {
         if (!accepted) resolve(false)
       })
+
+      // Ping immediately; only the correct CDC data port will respond.
+      try {
+        port.write(`${JSON.stringify({ type: 'ping' })}\n`)
+      } catch {
+        // ignore
+      }
 
       setTimeout(() => {
         if (!accepted) {
@@ -122,7 +229,7 @@ async function openCandidatePort(path: string) {
           }
           resolve(false)
         }
-      }, 2500)
+      }, 1200)
     })
   })
 }
@@ -131,7 +238,11 @@ async function startTelemetry() {
   const ports = await SerialPort.list()
 
   if (activePort && activePortPath && activePort.isOpen) {
-    return { success: true, port: activePortPath, ports: ports.map((p) => p.path) }
+    return {
+      success: hasSeenTelemetry,
+      port: activePortPath,
+      ports: ports.map((p) => p.path),
+    }
   }
 
   cleanupActivePort()
@@ -163,6 +274,44 @@ export function registerTelemetryIpc() {
   ipcMain.handle('telemetry-stop', async () => {
     cleanupActivePort()
     return { success: true }
+  })
+
+  ipcMain.handle('telemetry-set-active-profile', async (_, args?: { profile?: unknown }) => {
+    const profile = Number(args?.profile)
+    if (!Number.isInteger(profile) || profile < 0) {
+      return { success: false, error: 'Invalid profile index' }
+    }
+
+    try {
+      if (!activePort || !activePort.isOpen) {
+        await startTelemetry()
+      }
+
+      if (!activePort || !activePort.isOpen) {
+        return { success: false, error: 'MaxPad serial port not connected yet' }
+      }
+
+      const ackPromise = waitForProfileAck(profile, 3500)
+
+      // Retry command a few times while waiting for ACK/telemetry confirmation.
+      await sendSerialCommandAsync({ type: 'set_active_profile', profile })
+      setTimeout(() => {
+        if (pendingProfileAck?.profile === profile) {
+          void sendSerialCommandAsync({ type: 'set_active_profile', profile }).catch(() => null)
+        }
+      }, 500)
+      setTimeout(() => {
+        if (pendingProfileAck?.profile === profile) {
+          void sendSerialCommandAsync({ type: 'set_active_profile', profile }).catch(() => null)
+        }
+      }, 1200)
+
+      await ackPromise
+      return { success: true }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return { success: false, error: msg }
+    }
   })
 
   ipcMain.on('set-dirty-state', (event, dirty: boolean) => {

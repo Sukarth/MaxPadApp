@@ -34,6 +34,7 @@ export default function App() {
     telemetryConnected,
     liveScreenText,
     livePressed,
+    liveFirmwareTag,
     setConnected,
     setConfig,
     markSaved,
@@ -43,12 +44,15 @@ export default function App() {
     updateKeyMap,
     updateEncoder,
     renameProfile,
-    addProfile,
+    addProfileWithName,
     removeProfile,
     setTelemetryConnected,
     applyTelemetry,
     clearTelemetry
   } = useStore()
+
+  type ToastKind = 'success' | 'error' | 'info'
+  type Toast = { id: number; kind: ToastKind; message: string }
 
   const [scanning, setScanning] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -64,16 +68,30 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false)
   const [showCode, setShowCode] = useState(false)
   const [actionSearch, setActionSearch] = useState('')
+  const [createProfileModalOpen, setCreateProfileModalOpen] = useState(false)
+  const [newProfileName, setNewProfileName] = useState('')
+  const [creatingProfile, setCreatingProfile] = useState(false)
+  const [toasts, setToasts] = useState<Toast[]>([])
 
   const [unsavedModalOpen, setUnsavedModalOpen] = useState(false)
   const pendingActionRef = useRef<null | (() => Promise<void> | void)>(null)
   const telemetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const toastIdRef = useRef(0)
+
+  const pushToast = (kind: ToastKind, message: string) => {
+    const id = ++toastIdRef.current
+    setToasts((prev) => prev.concat({ id, kind, message }))
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id))
+    }, 3500)
+  }
 
   const scanDrive = async (driveHint?: string) => {
     setScanning(true)
     try {
       if (!window.api || typeof window.api.scanDevice !== 'function') {
         setBridgeError('IPC bridge not available (preload not loaded).')
+        pushToast('error', 'IPC bridge is unavailable. Please restart the app.')
         setConnected(false, null)
         return
       }
@@ -85,11 +103,14 @@ export default function App() {
       if (res.connected) {
         setConnected(true, res.drive)
         if (res.config) setConfig(res.config)
+        pushToast('success', `Connected to MaxPad at ${res.drive}`)
       } else {
         setConnected(false, null)
+        pushToast('error', 'MaxPad not found. Connect the board and try again.')
       }
     } catch (e: unknown) {
       setBridgeError(e instanceof Error ? e.message : String(e))
+      pushToast('error', 'Failed to scan for MaxPad.')
       setConnected(false, null)
     } finally {
       setScanning(false)
@@ -106,12 +127,17 @@ export default function App() {
   }
 
   const saveConfig = async () => {
-    if (!drive) return false
+    if (!drive || !connected) {
+      setBridgeError('MaxPad is not connected. Connect your board before saving.')
+      pushToast('error', 'Save failed: MaxPad is not connected.')
+      return false
+    }
 
     setSaving(true)
     try {
       if (!window.api || typeof window.api.saveConfig !== 'function') {
         setBridgeError('IPC bridge not available (preload not loaded).')
+        pushToast('error', 'Save failed: IPC bridge not available.')
         return false
       }
 
@@ -119,11 +145,15 @@ export default function App() {
       const res = await window.api.saveConfig({ drive, config, initializePython: true })
       if (res?.success) {
         markSaved()
+        pushToast('success', 'Saved to MaxPad successfully.')
         return true
       }
+      setBridgeError(res?.error || 'Save failed')
+      pushToast('error', res?.error || 'Save failed on MaxPad.')
       return false
     } catch (e: unknown) {
       setBridgeError(e instanceof Error ? e.message : String(e))
+      pushToast('error', e instanceof Error ? e.message : 'Save failed unexpectedly.')
       return false
     } finally {
       setSaving(false)
@@ -229,6 +259,61 @@ export default function App() {
     setRenamingIndex(null)
   }
 
+  const selectProfile = (index: number) => {
+    setCurrentProfile(index)
+
+    if (!connected || !window.api || typeof window.api.activateProfile !== 'function') {
+      pushToast('info', 'Profile selected locally. Connect MaxPad to activate on device.')
+      return
+    }
+
+    void window.api.activateProfile(index).then((res) => {
+      if (!res?.success && res?.error) {
+        setBridgeError(res.error)
+        pushToast('error', res.error)
+        return
+      }
+
+      pushToast('success', `Activated profile ${config.profiles[index]?.name || index + 1} on MaxPad.`)
+    })
+  }
+
+  const openCreateProfileModal = () => {
+    setNewProfileName(`Profile ${config.profiles.length + 1}`)
+    setCreateProfileModalOpen(true)
+  }
+
+  const cancelCreateProfileModal = () => {
+    if (creatingProfile) return
+    setCreateProfileModalOpen(false)
+  }
+
+  const saveNewProfileToMaxPad = async () => {
+    const trimmed = newProfileName.trim()
+    if (!trimmed) {
+      pushToast('error', 'Profile name cannot be empty.')
+      return
+    }
+
+    if (!connected || !drive) {
+      pushToast('error', 'Connect MaxPad before creating and saving a profile.')
+      return
+    }
+
+    setCreatingProfile(true)
+    const createdIndex = addProfileWithName(trimmed)
+    const saved = await saveConfig()
+
+    if (!saved) {
+      setCreatingProfile(false)
+      return
+    }
+
+    setCreateProfileModalOpen(false)
+    setCreatingProfile(false)
+    selectProfile(createdIndex)
+  }
+
   const cancelUnsavedModal = () => {
     pendingActionRef.current = null
     setUnsavedModalOpen(false)
@@ -272,6 +357,69 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-100 font-sans overflow-hidden select-none">
+      {toasts.length > 0 && (
+        <div className="absolute right-4 top-4 z-[70] space-y-2 w-[360px]">
+          {toasts.map((toast) => (
+            <div
+              key={toast.id}
+              className={`rounded-lg border px-3 py-2 text-xs shadow-xl ${toast.kind === 'success'
+                ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-200'
+                : toast.kind === 'error'
+                  ? 'border-red-500/30 bg-red-500/15 text-red-200'
+                  : 'border-cyan-500/30 bg-cyan-500/15 text-cyan-200'
+                }`}
+            >
+              {toast.message}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {createProfileModalOpen && (
+        <div className="absolute inset-0 z-[60] flex items-center justify-center bg-black/60">
+          <div className="w-[520px] rounded-2xl border border-zinc-800 bg-zinc-950/95 p-6 shadow-2xl">
+            <div className="text-sm font-bold">Create Profile</div>
+            <div className="text-xs text-zinc-400 mt-1">
+              Enter a profile name, then save it directly to MaxPad.
+            </div>
+
+            <div className="mt-4">
+              <label htmlFor="new-profile-name" className="text-[10px] uppercase text-zinc-500 font-bold">
+                Profile Name
+              </label>
+              <input
+                id="new-profile-name"
+                value={newProfileName}
+                onChange={(e) => setNewProfileName(e.target.value)}
+                className="mt-1 w-full bg-black/40 border border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
+                placeholder="My Profile"
+                autoFocus
+                disabled={creatingProfile}
+              />
+            </div>
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                className="px-4 py-2 rounded bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-sm"
+                onClick={cancelCreateProfileModal}
+                disabled={creatingProfile}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold disabled:opacity-60"
+                onClick={saveNewProfileToMaxPad}
+                disabled={creatingProfile}
+              >
+                {creatingProfile ? 'Saving...' : 'Save to MaxPad'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {unsavedModalOpen && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60">
           <div className="w-[520px] rounded-2xl border border-zinc-800 bg-zinc-950/95 p-6 shadow-2xl">
@@ -357,6 +505,7 @@ export default function App() {
                 ></div>
                 {telemetryConnected ? 'Live telemetry active' : 'Waiting for live telemetry'}
               </div>
+              <div className="text-[11px] text-zinc-500 px-1">FW: {liveFirmwareTag}</div>
               <div className="rounded-xl border border-zinc-800 bg-black/20 p-3">
                 <div className="flex items-center justify-between gap-3">
                   <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500">
@@ -436,7 +585,7 @@ export default function App() {
             <div className="text-xs uppercase text-zinc-500 font-bold">Profiles</div>
             <button
               type="button"
-              onClick={addProfile}
+              onClick={openCreateProfileModal}
               className="p-1 hover:bg-zinc-800 rounded text-zinc-400 hover:text-white"
             >
               <Plus size={14} />
@@ -450,11 +599,11 @@ export default function App() {
                 className={`group flex items-center justify-between p-2 rounded cursor-pointer transition ${currentProfile === idx ? 'bg-indigo-500 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}
                 role="button"
                 tabIndex={0}
-                onClick={() => setCurrentProfile(idx)}
+                onClick={() => selectProfile(idx)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault()
-                    setCurrentProfile(idx)
+                    selectProfile(idx)
                   }
                 }}
                 onDoubleClick={() => startRename(idx)}
@@ -581,11 +730,10 @@ export default function App() {
                           type="button"
                           key={slotLabel}
                           onClick={() => setActiveEncoderSlot(idx)}
-                          className={`flex-1 text-xs font-semibold py-2 rounded-md transition ${
-                            activeEncoderSlot === idx
-                              ? 'bg-indigo-600 text-white'
-                              : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
-                          }`}
+                          className={`flex-1 text-xs font-semibold py-2 rounded-md transition ${activeEncoderSlot === idx
+                            ? 'bg-indigo-600 text-white'
+                            : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+                            }`}
                         >
                           {slotLabel}
                         </button>
@@ -680,11 +828,11 @@ export default function App() {
                         const query = actionSearch.toLowerCase().trim()
                         const filtered = query
                           ? cat.actions.filter(
-                              (a) =>
-                                a.label.toLowerCase().includes(query) ||
-                                a.code.toLowerCase().includes(query) ||
-                                (a.shortLabel && a.shortLabel.toLowerCase().includes(query))
-                            )
+                            (a) =>
+                              a.label.toLowerCase().includes(query) ||
+                              a.code.toLowerCase().includes(query) ||
+                              (a.shortLabel && a.shortLabel.toLowerCase().includes(query))
+                          )
                           : cat.actions
 
                         if (filtered.length === 0) return null
@@ -705,11 +853,10 @@ export default function App() {
                                   <button
                                     type="button"
                                     key={action.code}
-                                    className={`group flex items-center justify-between px-2 py-1.5 rounded text-left text-xs transition ${
-                                      isActive
-                                        ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30'
-                                        : 'hover:bg-zinc-800 text-zinc-300 hover:text-white border border-transparent'
-                                    }`}
+                                    className={`group flex items-center justify-between px-2 py-1.5 rounded text-left text-xs transition ${isActive
+                                      ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30'
+                                      : 'hover:bg-zinc-800 text-zinc-300 hover:text-white border border-transparent'
+                                      }`}
                                     onClick={() => {
                                       if (encoderSelected) {
                                         updateEncoder(activeEncoderSlot, action.code)
@@ -720,11 +867,10 @@ export default function App() {
                                   >
                                     <span className="truncate">{action.label}</span>
                                     <span
-                                      className={`ml-2 text-[10px] font-mono shrink-0 transition ${
-                                        isActive
-                                          ? 'text-indigo-400/60'
-                                          : 'opacity-0 group-hover:opacity-100 text-zinc-500'
-                                      }`}
+                                      className={`ml-2 text-[10px] font-mono shrink-0 transition ${isActive
+                                        ? 'text-indigo-400/60'
+                                        : 'opacity-0 group-hover:opacity-100 text-zinc-500'
+                                        }`}
                                     >
                                       {action.code.replace('KC.', '')}
                                     </span>

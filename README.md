@@ -48,6 +48,7 @@ npm run build:linux
 	- On Windows, if auto-detect fails, try providing a drive hint like `D:` or `D:\`.
 3. Edit your profiles and click “Save to MaxPad”.
 	- If you enable initialization, the app writes `boot.py` and `code.py` too.
+4. Need other help? Ask AI!
 
 ## Development notes
 

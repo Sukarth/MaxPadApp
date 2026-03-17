@@ -24,6 +24,7 @@ declare global {
     api: {
       scanDevice: (args?: { driveHint?: string }) => Promise<ScanResult>
       saveConfig: (args: SaveConfigArgs) => Promise<SaveResult>
+      activateProfile: (profile: number) => Promise<{ success: boolean; error?: string }>
       startTelemetry: () => Promise<{ success: boolean }>
       stopTelemetry: () => Promise<{ success: boolean }>
       onTelemetry: (callback: (payload: Record<string, unknown>) => void) => () => void

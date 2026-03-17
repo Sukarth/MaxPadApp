@@ -108,10 +108,13 @@ serial_data = None
 try:
   serial_data = usb_cdc.data
 except Exception:
+  serial_data = None
+
+if serial_data is not None:
   try:
-    serial_data = usb_cdc.console
+    serial_data.timeout = 0
   except Exception:
-    serial_data = None
+    pass
 
 pressed_state = [False] * 12
 current_screen_text = "MAXPAD v1\\nReady..."
@@ -140,12 +143,94 @@ def send_telemetry(force=False):
     serial_data.write((json.dumps(payload) + "\\n").encode("utf-8"))
     last_telemetry = now
   except Exception:
+    pass
+
+_host_cmd_buffer = ""
+
+def handle_host_message(msg):
+  global current_layer
+
+  # Handshake: allows the desktop app to identify the correct CDC port.
+  if msg.get("type") == "ping":
     try:
-      usb_cdc.console.write((json.dumps(payload) + "\\n").encode("utf-8"))
-      last_telemetry = now
+      serial_data.write((json.dumps({"type": "pong", "ts": time.monotonic()}) + "\\n").encode("utf-8"))
     except Exception:
-      # Keep firmware stable even if host disconnects.
       pass
+
+    # Also emit telemetry immediately once the host has opened the data port.
+    send_telemetry(True)
+    return
+
+  if msg.get("type") != "set_active_profile":
+    return
+
+  profile = msg.get("profile", 0)
+  if not isinstance(profile, int):
+    return
+
+  if profile < 0:
+    profile = 0
+  if profile >= num_profiles:
+    profile = num_profiles - 1
+
+  keyboard.active_layers = [profile]
+  current_layer = profile
+  try:
+    serial_data.write((json.dumps({"type": "active_profile_set", "profile": profile, "ts": time.monotonic()}) + "\\n").encode("utf-8"))
+  except Exception:
+    pass
+  update_screen(mode_names.get(profile, f"PROFILE {profile} profile"))
+  send_telemetry(True)
+
+def process_host_commands():
+  global current_layer, _host_cmd_buffer
+  if serial_data is None:
+    return
+
+  # Non-blocking stream read. Buffer until newline, then parse each JSON line.
+  CR = chr(13)
+  LF = chr(10)
+  for _ in range(10):
+    try:
+      chunk = serial_data.read(128)
+    except Exception:
+      return
+
+    if not chunk:
+      break
+
+    try:
+      chunk_bytes = bytes(chunk)
+      chunk_text = chunk_bytes.decode("utf-8")
+    except Exception:
+      continue
+
+    # Normalize CRLF to LF and append to the rolling buffer.
+    try:
+      _host_cmd_buffer += chunk_text.replace(CR, LF)
+    except Exception:
+      continue
+
+    # Prevent unbounded growth if the host sends garbage without newlines.
+    if len(_host_cmd_buffer) > 4096:
+      _host_cmd_buffer = _host_cmd_buffer[-4096:]
+
+    while True:
+      nl = _host_cmd_buffer.find(LF)
+      if nl < 0:
+        break
+
+      line = _host_cmd_buffer[:nl]
+      _host_cmd_buffer = _host_cmd_buffer[nl + 1 :]
+
+      line = line.strip()
+      if not line:
+        continue
+
+      try:
+        handle_host_message(json.loads(line))
+      except Exception:
+        continue
 
 def expand_keys(keys, size=12):
     result = list(keys[:size])
@@ -235,6 +320,7 @@ class TelemetryModule(Module):
     return None
 
   def before_matrix_scan(self, keyboard):
+    process_host_commands()
     return None
 
   def after_matrix_scan(self, keyboard):
@@ -309,6 +395,7 @@ if __name__ == '__main__':
     update_screen("MAXPAD v1\\nReady...")
     keyboard._init()
     while True:
+        process_host_commands()
         new_layer = keyboard.active_layers[0] if keyboard.active_layers else 0
         if new_layer != current_layer:
             current_layer = new_layer

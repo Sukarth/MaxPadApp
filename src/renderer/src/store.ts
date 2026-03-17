@@ -51,6 +51,7 @@ type Store = {
   drive: string | null
   config: MaxPadConfig
   currentProfile: number
+  manualProfileLockUntil: number
   selectedKeyIndex: number | null
   encoderSelected: boolean
   activeEncoderSlot: number
@@ -58,6 +59,7 @@ type Store = {
   lastSavedConfigJson: string
   liveScreenText: string
   livePressed: boolean[]
+  liveFirmwareTag: string
   telemetryConnected: boolean
 
   setConnected: (val: boolean, drive: string | null) => void
@@ -72,6 +74,7 @@ type Store = {
   updateEncoder: (encIndex: number, kc: string) => void
   renameProfile: (index: number, name: string) => void
   addProfile: () => void
+  addProfileWithName: (name: string) => number
   removeProfile: (index: number) => void
   setTelemetryConnected: (connected: boolean) => void
   applyTelemetry: (payload: Record<string, unknown>) => void
@@ -83,6 +86,7 @@ export const useStore = create<Store>((set) => ({
   drive: null,
   config: structuredClone(DEFAULT_CONFIG),
   currentProfile: 0,
+  manualProfileLockUntil: 0,
   selectedKeyIndex: null,
   encoderSelected: false,
   activeEncoderSlot: 0,
@@ -90,17 +94,24 @@ export const useStore = create<Store>((set) => ({
   lastSavedConfigJson: serializeConfig(DEFAULT_CONFIG),
   liveScreenText: 'MAXPAD v1\nReady...',
   livePressed: new Array(12).fill(false),
+  liveFirmwareTag: 'unknown',
   telemetryConnected: false,
 
   setConnected: (connected, drive) => set({ connected, drive }),
   setConfig: (config) => set(() => {
     const normalized = normalizeConfig(config)
     const serialized = serializeConfig(normalized)
-    return { config: normalized, currentProfile: 0, selectedKeyIndex: null, encoderSelected: false, dirty: false, lastSavedConfigJson: serialized }
+    return { config: normalized, currentProfile: 0, manualProfileLockUntil: 0, selectedKeyIndex: null, encoderSelected: false, dirty: false, lastSavedConfigJson: serialized }
   }),
   markSaved: () => set((state) => ({ dirty: false, lastSavedConfigJson: serializeConfig(state.config) })),
 
-  setCurrentProfile: (currentProfile) => set({ currentProfile, selectedKeyIndex: null, encoderSelected: false }),
+  setCurrentProfile: (currentProfile) =>
+    set({
+      currentProfile,
+      manualProfileLockUntil: Date.now() + 1500,
+      selectedKeyIndex: null,
+      encoderSelected: false,
+    }),
   setSelectedKeyIndex: (index) => set({ selectedKeyIndex: index, encoderSelected: false }),
   setEncoderSelected: () => set({ encoderSelected: true, selectedKeyIndex: null, activeEncoderSlot: 0 }),
   setActiveEncoderSlot: (slot) => set({ activeEncoderSlot: slot }),
@@ -131,6 +142,22 @@ export const useStore = create<Store>((set) => ({
     })
     return { config: { profiles }, currentProfile: profiles.length - 1, selectedKeyIndex: null, dirty: true }
   }),
+  addProfileWithName: (name) => {
+    const nextName = name.trim()
+    let createdIndex = 0
+
+    set((state) => {
+      const profiles = state.config.profiles.concat({
+        name: nextName || `Profile ${state.config.profiles.length + 1}`,
+        keys: new Array(12).fill('KC.NO'),
+        encoder: ['KC.NO', 'KC.NO', 'KC.NO'],
+      })
+      createdIndex = profiles.length - 1
+      return { config: { profiles }, currentProfile: createdIndex, selectedKeyIndex: null, dirty: true }
+    })
+
+    return createdIndex
+  },
   removeProfile: (index) => set((state) => {
     if (state.config.profiles.length <= 1) return state
     const profiles = state.config.profiles.filter((_, i) => i !== index)
@@ -142,14 +169,21 @@ export const useStore = create<Store>((set) => ({
     while (nextPressed.length < 12) nextPressed.push(false)
 
     const screen = typeof payload?.screen === 'string' && payload.screen.trim() ? payload.screen : state.liveScreenText
+    const fwTag = typeof payload?.fw === 'string' && payload.fw.trim() ? payload.fw : state.liveFirmwareTag
     const rawProfile = payload?.active_profile
     const activeProfile = typeof rawProfile === 'number' && Number.isInteger(rawProfile) ? rawProfile : state.currentProfile
+
+    const shouldSyncProfileFromBoard = !state.dirty && Date.now() > state.manualProfileLockUntil
 
     return {
       livePressed: nextPressed,
       liveScreenText: screen,
-      currentProfile: activeProfile >= 0 && activeProfile < state.config.profiles.length ? activeProfile : state.currentProfile,
+      liveFirmwareTag: fwTag,
+      currentProfile:
+        shouldSyncProfileFromBoard && activeProfile >= 0 && activeProfile < state.config.profiles.length
+          ? activeProfile
+          : state.currentProfile,
     }
   }),
-  clearTelemetry: () => set({ livePressed: new Array(12).fill(false), telemetryConnected: false })
+  clearTelemetry: () => set({ livePressed: new Array(12).fill(false), telemetryConnected: false, liveFirmwareTag: 'unknown' })
 }))
